@@ -63,6 +63,7 @@
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import OutputEditView from './OutputEditView.svelte';
 	import { getOutputText, replaceOutputMessageText, type OutputItem } from './structuredOutput';
+	import { resolveMarkdownDone } from './markdown-update-scheduler';
 
 	interface MessageType {
 		id: string;
@@ -829,9 +830,7 @@
 									{compactPreview}
 									{editCodeBlock}
 									{topPadding}
-									done={($settings?.chatFadeStreamingText ?? true)
-										? (message?.done ?? false)
-										: true}
+									done={resolveMarkdownDone($settings?.chatFadeStreamingText, message?.done)}
 									{model}
 									onTaskClick={async (e) => {
 										console.log(e);
