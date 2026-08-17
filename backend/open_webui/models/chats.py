@@ -909,8 +909,10 @@ class ChatTable:
             if current_id is None
             else messages.get(current_id, {}).get('childrenIds', [])
         )
-        while child_ids:
+        visited_ids = set()
+        while child_ids and child_ids[-1] not in visited_ids:
             current_id = child_ids[-1]
+            visited_ids.add(current_id)
             child_ids = messages.get(current_id, {}).get('childrenIds', [])
         history['currentId'] = current_id if current_id in messages else None
         return deleted_ids
@@ -1042,7 +1044,12 @@ class ChatTable:
         return history_messages
 
     async def get_message_by_id_and_message_id(self, id: str, message_id: str) -> dict | None:
-        """Fetch a single message without pulling the whole chat JSON into Python."""
+        messages_map = await ChatMessages.get_messages_map_by_chat_id(id)
+        if messages_map and message_id in messages_map:
+            return messages_map[message_id]
+
+        # Legacy fallback: pull the single message out of the embedded chat JSON in SQL,
+        # rather than loading the whole chat into Python to read one key off it.
         try:
             async with get_async_db_context() as session:
                 stmt = select(Chat.chat[('history', 'messages', message_id)]).filter_by(id=id)
