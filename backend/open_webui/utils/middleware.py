@@ -5377,6 +5377,15 @@ async def streaming_chat_response_handler(response, ctx):
                         await event_emitter({'type': 'chat:completion', 'data': {'output': full_output()}})
                         return
 
+                    # Some providers restart tool-call numbering each round, so a later round can reuse an id an
+                    # earlier one already answered - the dedup below would then drop the call but keep its result.
+                    answered_call_ids = {
+                        item.get('call_id') for item in output if item.get('type') == 'function_call_output'
+                    }
+                    for tc in response_tool_calls:
+                        if tc.get('id') in answered_call_ids:
+                            tc['id'] = f'{tc.get("id")}-r{tool_call_iterations}'
+
                     # Append function_call items for each tool call
                     # (Responses API already has them from streaming, so skip duplicates)
                     existing_call_ids = {item.get('call_id') for item in output if item.get('type') == 'function_call'}
