@@ -4,17 +4,21 @@ Replaces the old single-row JSON blob machinery with a simple per-key model
 mirroring cptr's Config.
 
 Each config key is stored as its own row: key TEXT PK, value JSON.
-Reads are direct DB lookups. Writes are explicit awaited upserts that raise on
-failure (no more fire-and-forget create_task).
+Single-key reads are served from a short-lived snapshot of the whole table, which every write
+retires. Multi-key and whole-table reads go straight to the database. Writes are explicit awaited
+upserts that raise on failure (no more fire-and-forget create_task).
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from copy import deepcopy
 from typing import Any, ClassVar
 
+from aiocache import cached_stampede
 from fastapi.encoders import jsonable_encoder
+from open_webui.env import CONFIG_CACHE_TTL
 from open_webui.internal.db import Base, get_async_db
 from sqlalchemy import JSON, BigInteger, Column, Text, delete, select
 
@@ -95,6 +99,29 @@ def _json_value(value: Any) -> Any:
     return jsonable_encoder(value)
 
 
+# Part of the cache key, so a read in flight when a write lands stores under the retired generation.
+_cache_generation = 0
+
+
+# Stampede guarded: concurrent refills would otherwise let a slow one store its older snapshot last.
+@cached_stampede(
+    lease=CONFIG_CACHE_TTL,
+    ttl=CONFIG_CACHE_TTL,
+    key_builder=lambda _func: f'open_webui_config:{_cache_generation}',
+)
+async def _persisted_config() -> dict[str, Any]:
+    """Every persisted config row, in one query."""
+    async with get_async_db() as db:
+        result = await db.execute(select(Config))
+        return {row.key: row.value for row in result.scalars().all()}
+
+
+def _invalidate_cache() -> None:
+    # A new generation is a new cache key, so the old snapshot is unreachable and expires on its own.
+    global _cache_generation
+    _cache_generation += 1
+
+
 # ── Model ────────────────────────────────────────────────────────────────────
 
 
@@ -142,9 +169,14 @@ class Config(Base):
         """Get a config value by key. Returns default if not set."""
         if not Config.persistent_enabled_for(key):
             return Config.default_value(key, default)
-        async with get_async_db() as db:
-            row = await db.get(Config, key)
-            return row.value if row else Config.default_value(key, default)
+        # These keys get read, mutated, then written back whole, so a stale read drops another worker's change.
+        if key in {'tool_server.connections', 'events.webhooks', 'external_knowledge.connections'}:
+            async with get_async_db() as db:
+                row = await db.get(Config, key)
+                return row.value if row else Config.default_value(key, default)
+        values = await _persisted_config()
+        # Callers mutate what they read, so hand out a copy.
+        return deepcopy(values[key]) if key in values else Config.default_value(key, default)
 
     @staticmethod
     async def get_many(*keys: str) -> dict:
@@ -218,6 +250,7 @@ class Config(Base):
                 else:
                     db.add(Config(key=key, value=value, updated_at=now))
             await db.commit()
+            _invalidate_cache()
 
     @staticmethod
     async def delete(key: str) -> bool:
@@ -227,6 +260,7 @@ class Config(Base):
             if row:
                 await db.delete(row)
                 await db.commit()
+                _invalidate_cache()
                 return True
             return False
 
@@ -236,6 +270,7 @@ class Config(Base):
         async with get_async_db() as db:
             await db.execute(delete(Config))
             await db.commit()
+            _invalidate_cache()
 
     @staticmethod
     async def seed_defaults(defaults: dict) -> None:
@@ -263,6 +298,7 @@ class Config(Base):
 
             if new_count:
                 await db.commit()
+                _invalidate_cache()
                 log.info('Seeded %d new config defaults', new_count)
 
     @staticmethod
@@ -291,6 +327,7 @@ class Config(Base):
                 await db.delete(row)
 
             await db.commit()
+            _invalidate_cache()
             log.info(
                 'Renamed %d config keys from %s.* to %s.*; deleted %d old duplicates',
                 moved_count,
@@ -376,6 +413,7 @@ class Config(Base):
 
             if repaired_keys or orphan_keys or default_model_keys:
                 await db.commit()
+                _invalidate_cache()
                 if repaired_keys or orphan_keys:
                     log.info('Repaired flattened dict config rows for %s', ', '.join(repaired_keys))
                 if default_model_keys:
