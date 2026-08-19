@@ -12,6 +12,12 @@
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import VideoInputMenu from './CallOverlay/VideoInputMenu.svelte';
+	import {
+		createAsyncQueue,
+		hasLiveAudioTrack,
+		singleFlight,
+		watchAudioTrackEnd
+	} from './CallOverlay/audio-stream';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
@@ -44,6 +50,12 @@
 	let mediaRecorder;
 	let audioStream = null;
 	let audioChunks = [];
+	let audioStatus: 'listening' | 'reconnecting' | 'unavailable' = 'reconnecting';
+	let stopWatchingAudioTrack = () => {};
+	let audioAnalysisGeneration = 0;
+	let callOverlayDestroyed = false;
+	let watchingAudioDevices = false;
+	const enqueueAudioTransition = createAsyncQueue();
 
 	let videoInputDevices = [];
 	let selectedVideoInputDeviceId = null;
@@ -194,7 +206,7 @@
 			mediaRecorder = false;
 
 			if (_continue) {
-				startRecording();
+				await startRecording();
 			}
 
 			if (confirmed) {
@@ -230,52 +242,92 @@
 		}
 	};
 
-	const startRecording = async () => {
-		if ($showCallOverlay) {
-			if (!audioStream) {
-				audioStream = await navigator.mediaDevices.getUserMedia({
-					audio: {
-						echoCancellation: true,
-						noiseSuppression: true,
-						autoGainControl: true
-					}
+	const startRecordingUnlocked = async () => {
+		if ($showCallOverlay && !callOverlayDestroyed) {
+			if (mediaRecorder && hasLiveAudioTrack(audioStream)) {
+				audioStatus = 'listening';
+				return true;
+			}
+
+			if (!hasLiveAudioTrack(audioStream)) {
+				audioStatus = 'reconnecting';
+
+				try {
+					audioStream = await navigator.mediaDevices.getUserMedia({
+						audio: {
+							echoCancellation: true,
+							noiseSuppression: true,
+							autoGainControl: true
+						}
+					});
+				} catch (error) {
+					return await handleAudioSetupError(error);
+				}
+
+				if (!$showCallOverlay || callOverlayDestroyed) {
+					audioStream.getAudioTracks().forEach((track) => track.stop());
+					audioStream = null;
+					return false;
+				}
+
+				stopWatchingAudioTrack();
+				stopWatchingAudioTrack = watchAudioTrackEnd(audioStream, () => {
+					void recoverAudioStream();
 				});
 			}
 
-			if (audioStream) {
-				// hardware track muting disabled to prevent backend translation errors with malformed WebM files
+			if (!hasLiveAudioTrack(audioStream)) {
+				return await handleAudioSetupError(new Error('Acquired audio stream has no live track.'));
 			}
 
-			mediaRecorder = new MediaRecorder(audioStream);
+			try {
+				mediaRecorder = new MediaRecorder(audioStream);
 
-			mediaRecorder.onstart = () => {
-				console.log('Recording started');
-				audioChunks = [];
-			};
+				mediaRecorder.onstart = () => {
+					console.log('Recording started');
+					audioChunks = [];
+				};
 
-			mediaRecorder.ondataavailable = (event) => {
-				if (hasStartedSpeaking) {
-					audioChunks.push(event.data);
-				}
-			};
+				mediaRecorder.ondataavailable = (event) => {
+					if (hasStartedSpeaking) {
+						audioChunks.push(event.data);
+					}
+				};
 
-			mediaRecorder.onstop = (e) => {
-				console.log('Recording stopped', audioStream, e);
-				stopRecordingCallback();
-			};
+				mediaRecorder.onstop = (e) => {
+					console.log('Recording stopped', audioStream, e);
+					void stopRecordingCallback();
+				};
 
-			analyseAudio(audioStream);
+				analyseAudio(audioStream, ++audioAnalysisGeneration);
+				audioStatus = 'listening';
+				return true;
+			} catch (error) {
+				return await handleAudioSetupError(error);
+			}
 		}
+
+		return false;
 	};
 
+	const startRecording = () => enqueueAudioTransition(startRecordingUnlocked);
+
 	const stopAudioStream = async () => {
+		const recorder = mediaRecorder;
+		mediaRecorder = false;
+		audioAnalysisGeneration += 1;
+
 		try {
-			if (mediaRecorder) {
-				mediaRecorder.stop();
+			if (recorder && recorder.state !== 'inactive') {
+				recorder.onstop = null;
+				recorder.stop();
 			}
 		} catch (error) {
 			console.log('Error stopping audio stream:', error);
 		}
+
+		stopWatchingAudioTrack();
+		stopWatchingAudioTrack = () => {};
 
 		if (!audioStream) return;
 
@@ -284,6 +336,55 @@
 		});
 
 		audioStream = null;
+	};
+
+	const handleAudioSetupError = async (error: unknown) => {
+		console.error('Error setting up media devices.', error);
+		await stopAudioStream();
+
+		if (!$showCallOverlay || callOverlayDestroyed) {
+			return false;
+		}
+
+		audioStatus = 'unavailable';
+		toast.error($i18n.t('Error accessing media devices.'));
+		return false;
+	};
+
+	const recoverAudioStream = singleFlight(() =>
+		enqueueAudioTransition(async () => {
+			if (!$showCallOverlay || callOverlayDestroyed) {
+				return false;
+			}
+
+			audioStatus = 'reconnecting';
+			hasStartedSpeaking = false;
+			confirmed = false;
+			audioChunks = [];
+
+			await stopAudioStream();
+			return await startRecordingUnlocked();
+		})
+	);
+
+	const handleAudioDeviceChange = () => {
+		if ($showCallOverlay && !hasLiveAudioTrack(audioStream)) {
+			void recoverAudioStream();
+		}
+	};
+
+	const startWatchingAudioDevices = () => {
+		if (!watchingAudioDevices && !callOverlayDestroyed) {
+			navigator.mediaDevices.addEventListener('devicechange', handleAudioDeviceChange);
+			watchingAudioDevices = true;
+		}
+	};
+
+	const stopWatchingAudioDevices = () => {
+		if (watchingAudioDevices) {
+			navigator.mediaDevices.removeEventListener('devicechange', handleAudioDeviceChange);
+			watchingAudioDevices = false;
+		}
 	};
 
 	// Function to calculate the RMS level from time domain data
@@ -296,13 +397,23 @@
 		return Math.sqrt(sumSquares / data.length);
 	};
 
-	const analyseAudio = (stream) => {
+	const analyseAudio = (stream: MediaStream, generation: number) => {
 		const audioContext = new AudioContext();
-		const audioStreamSource = audioContext.createMediaStreamSource(stream);
+		let audioStreamSource;
+		let analyser;
+		const closeAudioContext = () => {
+			void audioContext.close().catch(() => {});
+		};
 
-		const analyser = audioContext.createAnalyser();
-		analyser.minDecibels = MIN_DECIBELS;
-		audioStreamSource.connect(analyser);
+		try {
+			audioStreamSource = audioContext.createMediaStreamSource(stream);
+			analyser = audioContext.createAnalyser();
+			analyser.minDecibels = MIN_DECIBELS;
+			audioStreamSource.connect(analyser);
+		} catch (error) {
+			closeAudioContext();
+			throw error;
+		}
 
 		const bufferLength = analyser.frequencyBinCount;
 
@@ -313,10 +424,20 @@
 		hasStartedSpeaking = false;
 
 		console.log('🔊 Sound detection started', lastSoundTime, hasStartedSpeaking);
+		let analysisStopped = false;
+		const stopAnalysis = () => {
+			if (analysisStopped) {
+				return;
+			}
+
+			analysisStopped = true;
+			closeAudioContext();
+		};
 
 		const detectSound = () => {
 			const processFrame = () => {
-				if (!mediaRecorder || !$showCallOverlay) {
+				if (!mediaRecorder || !$showCallOverlay || generation !== audioAnalysisGeneration) {
+					stopAnalysis();
 					return;
 				}
 
@@ -364,6 +485,7 @@
 						if (mediaRecorder) {
 							console.log('%c%s', 'color: red; font-size: 20px;', '🔇 Silence detected');
 							mediaRecorder.stop();
+							stopAnalysis();
 							return;
 						}
 					}
@@ -682,7 +804,7 @@
 		}
 	};
 
-	onMount(async () => {
+	onMount(() => {
 		const setWakeLock = async () => {
 			try {
 				wakeLock = await navigator.wakeLock.request('screen');
@@ -700,49 +822,40 @@
 			}
 		};
 
-		if ('wakeLock' in navigator) {
-			await setWakeLock();
+		const handleVisibilityChange = () => {
+			if (wakeLock !== null && document.visibilityState === 'visible') {
+				void setWakeLock();
+			}
+		};
 
-			document.addEventListener('visibilitychange', async () => {
-				// Re-request the wake lock if the document becomes visible
-				if (wakeLock !== null && document.visibilityState === 'visible') {
-					await setWakeLock();
-				}
-			});
+		if ('wakeLock' in navigator) {
+			void setWakeLock();
+			document.addEventListener('visibilitychange', handleVisibilityChange);
 		}
 
 		model = $models.find((m) => m.id === modelId);
-
-		startRecording();
 
 		eventTarget.addEventListener('chat:start', chatStartHandler);
 		eventTarget.addEventListener('chat', chatEventHandler);
 		eventTarget.addEventListener('chat:finish', chatFinishHandler);
 
 		document.addEventListener('keydown', handleKeydown);
+		void startRecording().finally(startWatchingAudioDevices);
 
-		return async () => {
-			await stopAllAudio();
-
-			stopAudioStream();
-
+		return () => {
+			callOverlayDestroyed = true;
 			eventTarget.removeEventListener('chat:start', chatStartHandler);
 			eventTarget.removeEventListener('chat', chatEventHandler);
 			eventTarget.removeEventListener('chat:finish', chatFinishHandler);
 
 			document.removeEventListener('keydown', handleKeydown);
-
-			audioAbortController.abort();
-			await tick();
-
-			await stopAllAudio();
-
-			await stopRecordingCallback(false);
-			await stopCamera();
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
+			stopWatchingAudioDevices();
 		};
 	});
 
 	onDestroy(async () => {
+		callOverlayDestroyed = true;
 		await stopAllAudio();
 		await stopRecordingCallback(false);
 		await stopCamera();
@@ -753,6 +866,7 @@
 		eventTarget.removeEventListener('chat:finish', chatFinishHandler);
 
 		document.removeEventListener('keydown', handleKeydown);
+		stopWatchingAudioDevices();
 
 		audioAbortController.abort();
 
@@ -957,6 +1071,8 @@
 				on:click={() => {
 					if (assistantSpeaking) {
 						stopAllAudio();
+					} else if (audioStatus === 'unavailable') {
+						void recoverAudioStream();
 					}
 				}}
 			>
@@ -967,6 +1083,10 @@
 						{$i18n.t('Muted')}
 					{:else if assistantSpeaking}
 						{$i18n.t('Tap to interrupt')}
+					{:else if audioStatus === 'reconnecting'}
+						{$i18n.t('Connection lost. Reconnecting...')}
+					{:else if audioStatus === 'unavailable'}
+						{$i18n.t('Error accessing media devices.')} {$i18n.t('Retry')}
 					{:else}
 						{$i18n.t('Listening...')}
 					{/if}
